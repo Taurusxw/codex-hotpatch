@@ -1,0 +1,35 @@
+# Local handover and machine-specific runtime state
+HANDOFF.md
+**/HANDOFF.md
+.env
+.env.*
+!.env.example
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+network-health.json
+network-runtime-cursor.json
+*.lnk
+
+# Tooling and editor output
+node_modules/
+coverage/
+.tmp/
+tmp/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local archives and credentials
+*.key
+*.pem
+*.pfx
+*.p12
+*.zip
+*.7z
+*.tar
+*.gz
