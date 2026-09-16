@@ -5,13 +5,30 @@ import { pathToFileURL } from 'node:url';
 import { createCompletionEvidenceIndex } from './completion-evidence.mjs';
 import { createCodexDevToolsTransport } from '../shared/codex-devtools-transport.mjs';
 
-export const patchVersion = '1.3.12';
+export const patchVersion = '1.3.22';
 const codexRoot = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
-const sessionsRoot = path.join(codexRoot, 'sessions');
+const sessionRoots = [
+  path.join(codexRoot, 'sessions'),
+  path.join(codexRoot, 'archived_sessions'),
+];
+const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+const completionCachePath = path.join(
+  localAppData,
+  'OpenAI',
+  'Codex',
+  'hotpatches',
+  'subagent-status',
+  'completion-evidence-cache.json',
+);
+const completionEvidenceOptions = {
+  cachePath: completionCachePath,
+  agentMetadataDatabasePath: path.join(codexRoot, 'state_5.sqlite'),
+};
 
 export function installInRenderer(initialEvidence, version) {
   const settleTimeoutMs = 5000;
-  const itemSpacingMs = 200;
+  const itemSpacingMs = 50;
+  const rendererYieldTimeoutMs = 150;
   const maxItemsPerOpen = 128;
   const maxShowMoreClicks = 20;
   const maxContinuationPasses = 8;
@@ -30,6 +47,7 @@ export function installInRenderer(initialEvidence, version) {
   let disabled = false;
   let processing = false;
   let startTimer = null;
+  let projectionTimer = null;
   let panelProbeTimer = null;
   let lastVisiblePanelId = null;
   let pendingReason = null;
@@ -50,6 +68,7 @@ export function installInRenderer(initialEvidence, version) {
   let lastSkippedUnverified = 0;
   let lastUnidentified = 0;
   let lastUnidentifiedLabels = [];
+  let lastMetadataResolvedIds = [];
   let lastOpenedIds = [];
   let projectionRuns = 0;
   let projectedCompletedCount = 0;
@@ -60,11 +79,51 @@ export function installInRenderer(initialEvidence, version) {
   let projectedSummaryCompletedCount = 0;
   let lastProjectedSummaryIds = [];
   let lastSummaryProjectionAt = 0;
+  let agentMetadataError = initialEvidence?.agentMetadataError || null;
   const projectedAgents = new Map();
   const projectedSummaryLabels = new Map();
+  let agentMetadata = normalizeAgentMetadata(initialEvidence?.agents);
 
   function normalized(value) {
     return (value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function normalizedLookup(value) {
+    return normalized(value)
+      .toLocaleLowerCase()
+      .replace(/[_-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function normalizeAgentMetadata(records) {
+    const exactId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    const result = new Map();
+    for (const record of records || []) {
+      const conversationId = record?.conversationId?.toLowerCase?.() || '';
+      const parentConversationId = record?.parentConversationId?.toLowerCase?.() || '';
+      if (!exactId.test(conversationId) || !exactId.test(parentConversationId)) continue;
+      result.set(conversationId, {
+        conversationId,
+        parentConversationId,
+        agentPath: typeof record.agentPath === 'string' ? record.agentPath : '',
+        agentNickname: typeof record.agentNickname === 'string' ? record.agentNickname : '',
+      });
+    }
+    return result;
+  }
+
+  function metadataDisplayLabel(record) {
+    const leaf = record?.agentPath?.split(/[\\/]/).filter(Boolean).at(-1) || '';
+    return normalizedLookup(leaf);
+  }
+
+  function buttonStartsWithLabel(buttonText, label) {
+    const normalizedButton = normalizedLookup(buttonText);
+    const normalizedLabel = normalizedLookup(label);
+    return Boolean(normalizedLabel)
+      && (normalizedButton === normalizedLabel
+        || normalizedButton.startsWith(`${normalizedLabel} `));
   }
 
   function isVisible(element) {
@@ -79,8 +138,41 @@ export function installInRenderer(initialEvidence, version) {
     );
   }
 
+  function collectNestedSubagentArrays(value, arrays, visitedValues, depth = 0) {
+    if (!value || typeof value !== 'object' || depth > 4 || visitedValues.has(value)) return;
+    visitedValues.add(value);
+    if (isSubagentArray(value)) {
+      if (!arrays.includes(value)) arrays.push(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      if (value.length <= 32) {
+        for (const item of value) {
+          if (item?.props || item?.children) {
+            collectNestedSubagentArrays(item, arrays, visitedValues, depth + 1);
+          }
+        }
+      }
+      return;
+    }
+    for (const key of [
+      'backgroundAgents',
+      'subagents',
+      'agents',
+      'children',
+      'props',
+      'data',
+      'item',
+    ]) {
+      if (key in value) {
+        collectNestedSubagentArrays(value[key], arrays, visitedValues, depth + 1);
+      }
+    }
+  }
+
   function collectCandidateSubagentArrays(candidate, visitedFibers = new Set()) {
     const arrays = [];
+    const visitedValues = new Set();
     const fiberKey = Object.keys(candidate).find((key) => key.startsWith('__reactFiber$'));
     let fiber = fiberKey ? candidate[fiberKey] : null;
     for (let depth = 0; fiber && depth < 50; depth += 1, fiber = fiber.return) {
@@ -89,7 +181,7 @@ export function installInRenderer(initialEvidence, version) {
       for (const props of [fiber.memoizedProps, fiber.pendingProps]) {
         if (!props || typeof props !== 'object') continue;
         for (const value of Object.values(props)) {
-          if (isSubagentArray(value) && !arrays.includes(value)) arrays.push(value);
+          collectNestedSubagentArrays(value, arrays, visitedValues);
         }
       }
     }
@@ -103,12 +195,21 @@ export function installInRenderer(initialEvidence, version) {
         controls.push(control);
       }
     }
+    for (const control of document.querySelectorAll(
+      '[data-slot="thread-summary-panel-item-button"]',
+    )) {
+      if (isVisible(control)
+          && !controls.includes(control)
+          && collectCandidateSubagentArrays(control).length) {
+        controls.push(control);
+      }
+    }
     return controls;
   }
 
-  function collectSubagentArrays() {
+  function collectSubagentArrays(initialControls = null) {
     const arrays = [];
-    const candidates = summaryControls();
+    const candidates = initialControls ? [...initialControls] : summaryControls();
     for (const button of document.querySelectorAll(
       '[data-slot="thread-summary-panel-item-group"] > button',
     )) {
@@ -124,18 +225,32 @@ export function installInRenderer(initialEvidence, version) {
     return arrays;
   }
 
-  function summaryLabelText(label, activeCount, totalCount) {
-    const original = projectedSummaryLabels.get(label)?.originalText || normalized(label.textContent);
+  function summaryTexts(label, meta, activeCount, totalCount) {
+    const record = projectedSummaryLabels.get(label);
+    const original = [
+      record?.originalText || normalized(label.textContent),
+      record?.metaOriginalText || normalized(meta?.textContent),
+    ].join(' ');
     const english = /^en\b/i.test(document.documentElement?.lang || '')
       || /\b(?:active|running|done|completed)\b/i.test(original);
-    if (activeCount > 0) return english ? `${activeCount} running` : `${activeCount} 个运行中`;
-    return english ? `${totalCount} done` : `${totalCount} 完成`;
+    const completedCount = Math.max(totalCount - activeCount, 0);
+    return {
+      label: activeCount > 0
+        ? (english ? `${activeCount} running` : `${activeCount} 个运行中`)
+        : (english ? `${totalCount} done` : `${totalCount} 完成`),
+      meta: activeCount > 0 && completedCount > 0
+        ? (english ? `${completedCount} done` : `${completedCount} 完成`)
+        : '',
+    };
   }
 
   function restoreSummaryLabel(label) {
     const record = projectedSummaryLabels.get(label);
     if (!record) return;
     if (label.textContent === record.projectedText) label.textContent = record.originalText;
+    if (record.meta?.textContent === record.metaProjectedText) {
+      record.meta.textContent = record.metaOriginalText;
+    }
     projectedSummaryLabels.delete(label);
   }
 
@@ -148,6 +263,7 @@ export function installInRenderer(initialEvidence, version) {
     for (const control of summaryControls()) {
       const label = control.querySelector?.('[data-slot="thread-summary-panel-item-label"]');
       if (!label) continue;
+      const meta = control.querySelector?.('[data-slot="thread-summary-panel-item-meta"]') || null;
       visibleLabels.add(label);
 
       const agentsById = new Map();
@@ -168,15 +284,23 @@ export function installInRenderer(initialEvidence, version) {
 
       for (const id of verifiedIds) projectedIds.add(id);
       const activeCount = agents.filter((agent) => agent?.status !== 'done').length;
-      const projectedText = summaryLabelText(label, activeCount, agents.length);
+      const projected = summaryTexts(label, meta, activeCount, agents.length);
       let record = projectedSummaryLabels.get(label);
       if (!record) {
-        record = { originalText: label.textContent, projectedText };
+        record = {
+          originalText: label.textContent,
+          projectedText: projected.label,
+          meta,
+          metaOriginalText: meta?.textContent || '',
+          metaProjectedText: projected.meta,
+        };
         projectedSummaryLabels.set(label, record);
       } else {
-        record.projectedText = projectedText;
+        record.projectedText = projected.label;
+        record.metaProjectedText = projected.meta;
       }
-      if (label.textContent !== projectedText) label.textContent = projectedText;
+      if (label.textContent !== projected.label) label.textContent = projected.label;
+      if (meta && meta.textContent !== projected.meta) meta.textContent = projected.meta;
     }
 
     for (const label of projectedSummaryLabels.keys()) {
@@ -192,7 +316,8 @@ export function installInRenderer(initialEvidence, version) {
     projectionRuns += 1;
     lastProjectionReason = reason;
     lastProjectionAt = Date.now();
-    const subagentArrays = collectSubagentArrays();
+    const summaryControlList = summaryControls();
+    const subagentArrays = collectSubagentArrays(summaryControlList);
     const currentAgents = new Set();
     for (const subagents of subagentArrays) {
       for (const agent of subagents) currentAgents.add(agent);
@@ -262,30 +387,40 @@ export function installInRenderer(initialEvidence, version) {
     const buttonFiber = fiberKey ? button[fiberKey] : null;
     const expectedParent = panelId()?.toLowerCase() || null;
 
-    let subagents = null;
-    for (let fiber = buttonFiber, depth = 0; fiber && depth < 40; depth += 1, fiber = fiber.return) {
-      const candidate = fiber.memoizedProps?.subagents || fiber.pendingProps?.subagents;
-      if (Array.isArray(candidate)) {
-        subagents = candidate;
-        break;
+    const subagentsById = new Map();
+    for (const candidate of collectCandidateSubagentArrays(button)) {
+      for (const agent of candidate) {
+        const id = agent?.conversationId?.toLowerCase() || null;
+        if (id && !subagentsById.has(id)) subagentsById.set(id, agent);
       }
     }
-    if (!subagents) return null;
-
-    if (!expectedParent || !exactId.test(expectedParent)) return null;
+    const subagents = [...subagentsById.values()];
     const allowedIds = new Set();
-    const ancestry = new Set([expectedParent]);
-    for (let pass = 0; pass < subagents.length; pass += 1) {
-      let changed = false;
-      for (const agent of subagents) {
-        const id = agent?.conversationId?.toLowerCase() || null;
-        const parent = agent?.parentConversationId?.toLowerCase() || null;
-        if (!exactId.test(id || '') || !ancestry.has(parent) || allowedIds.has(id)) continue;
-        allowedIds.add(id);
-        ancestry.add(id);
-        changed = true;
+    const metadataCandidates = [];
+    if (expectedParent && exactId.test(expectedParent)) {
+      const ancestry = new Set([expectedParent]);
+      for (let pass = 0; pass < subagents.length; pass += 1) {
+        let changed = false;
+        for (const agent of subagents) {
+          const id = agent?.conversationId?.toLowerCase() || null;
+          const parent = agent?.parentConversationId?.toLowerCase() || null;
+          if (!exactId.test(id || '') || !ancestry.has(parent) || allowedIds.has(id)) continue;
+          allowedIds.add(id);
+          ancestry.add(id);
+          changed = true;
+        }
+        if (!changed) break;
       }
-      if (!changed) break;
+      for (const record of agentMetadata.values()) {
+        if (record.parentConversationId !== expectedParent) continue;
+        metadataCandidates.push(record);
+        allowedIds.add(record.conversationId);
+      }
+    } else {
+      for (const record of agentMetadata.values()) {
+        metadataCandidates.push(record);
+        allowedIds.add(record.conversationId);
+      }
     }
     if (!allowedIds.size) return null;
 
@@ -334,7 +469,22 @@ export function installInRenderer(initialEvidence, version) {
         && displayName
         && (buttonText === displayName || buttonText.startsWith(`${displayName} `));
     });
-    if (nameMatches.length === 1) return nameMatches[0].conversationId.toLowerCase();
+    const matchedIds = new Set(nameMatches.map((agent) => agent.conversationId.toLowerCase()));
+    const metadataMatches = metadataCandidates.filter((record) => {
+      const displayLabel = metadataDisplayLabel(record);
+      if (displayLabel && buttonStartsWithLabel(buttonText, displayLabel)) return true;
+      return !displayLabel
+        && record.agentNickname
+        && buttonStartsWithLabel(buttonText, record.agentNickname);
+    });
+    for (const record of metadataMatches) matchedIds.add(record.conversationId);
+    if (matchedIds.size === 1) {
+      const [id] = matchedIds;
+      if (metadataMatches.some((record) => record.conversationId === id)) {
+        if (!lastMetadataResolvedIds.includes(id)) lastMetadataResolvedIds.push(id);
+      }
+      return id;
+    }
     return null;
   }
 
@@ -402,9 +552,9 @@ export function installInRenderer(initialEvidence, version) {
     if (signal.aborted || disabled) return;
     await new Promise((resolve) => {
       if ('requestIdleCallback' in window) {
-        window.requestIdleCallback(resolve, { timeout: 500 });
+        window.requestIdleCallback(resolve, { timeout: rendererYieldTimeoutMs });
       } else {
-        setTimeout(resolve, 100);
+        setTimeout(resolve, 25);
       }
     });
     if (!signal.aborted && !disabled) {
@@ -425,6 +575,7 @@ export function installInRenderer(initialEvidence, version) {
     const observed = new Set();
     const skipped = new Set();
     const unidentified = new Set();
+    lastMetadataResolvedIds = [];
     let showMoreClicks = 0;
     let processedThisRun = 0;
     let expectedPanelId = null;
@@ -447,6 +598,7 @@ export function installInRenderer(initialEvidence, version) {
         return;
       }
       expectedPanelId = panelId();
+      lastVisiblePanelId = expectedPanelId || 'visible-panel-without-id';
 
       while (!disabled && !signal.aborted && processedThisRun < maxItemsPerOpen) {
         if (document.hidden) {
@@ -541,6 +693,7 @@ export function installInRenderer(initialEvidence, version) {
       lastSkippedUnverified = skipped.size;
       lastUnidentified = unidentified.size;
       lastUnidentifiedLabels = [...unidentified].slice(0, 20);
+      lastMetadataResolvedIds = lastMetadataResolvedIds.slice(0, 20);
       processing = false;
       lastRunAt = Date.now();
       activeController = null;
@@ -566,7 +719,7 @@ export function installInRenderer(initialEvidence, version) {
     pendingReason = null;
   }
 
-  function scheduleRefresh(reason, delayMs = 350) {
+  function scheduleRefresh(reason, delayMs = 0) {
     if (disabled) return;
     if (processing) {
       pendingReason = reason;
@@ -576,8 +729,19 @@ export function installInRenderer(initialEvidence, version) {
     const scheduledEpoch = interactionEpoch;
     startTimer = setTimeout(() => {
       startTimer = null;
-      if (disabled || scheduledEpoch !== interactionEpoch || !headingInfo(activeHeadingPattern)) return;
+      if (disabled || scheduledEpoch !== interactionEpoch) return;
       void refreshVisibleList(reason);
+    }, delayMs);
+  }
+
+  function scheduleProjection(reason, delayMs = 100) {
+    if (disabled) return;
+    if (projectionTimer) clearTimeout(projectionTimer);
+    const scheduledEpoch = interactionEpoch;
+    projectionTimer = setTimeout(() => {
+      projectionTimer = null;
+      if (disabled || scheduledEpoch !== interactionEpoch) return;
+      reconcileProjectedStatuses(reason);
     }, delayMs);
   }
 
@@ -597,12 +761,12 @@ export function installInRenderer(initialEvidence, version) {
       return;
     }
     const visiblePanelId = panelId() || 'visible-panel-without-id';
-    reconcileProjectedStatuses('visible-panel-probe');
     if (visiblePanelId === lastVisiblePanelId) return;
     lastVisiblePanelId = visiblePanelId;
+    reconcileProjectedStatuses('panel-became-visible');
     panelOpenCount += 1;
     continuationPasses = 0;
-    scheduleRefresh('panel-became-visible', 250);
+    scheduleRefresh('panel-became-visible');
   }
 
   function onDocumentClick(event) {
@@ -619,6 +783,8 @@ export function installInRenderer(initialEvidence, version) {
       interactionEpoch += 1;
       cancelScheduled();
       if (processing) abortActive('user-interaction');
+      scheduleProjection('post-user-interaction');
+      scheduleRefresh('post-user-interaction-resume', 2000);
     }
   }
 
@@ -627,7 +793,15 @@ export function installInRenderer(initialEvidence, version) {
       interactionEpoch += 1;
       cancelScheduled();
       if (processing) abortActive('user-interaction');
+      scheduleProjection('post-user-interaction');
+      scheduleRefresh('post-user-interaction-resume', 2000);
     }
+  }
+
+  function onVisibilityChange() {
+    if (disabled || document.hidden || !headingInfo(activeHeadingPattern)) return;
+    scheduleProjection('page-visible');
+    scheduleRefresh('page-visible-resume', 500);
   }
 
   function status(reused = false) {
@@ -635,8 +809,8 @@ export function installInRenderer(initialEvidence, version) {
       installed: !disabled,
       version,
       reused,
-      trigger: 'pre-open-projection-panel-probe-and-detail-fallback',
-      filter: 'structural-agent-array-and-latest-task-complete',
+      trigger: 'event-driven-projection-and-resumable-detail-migration',
+      filter: 'bounded-react-agent-array-readonly-state-metadata-and-latest-task-complete',
       observerInstalled: false,
       panelProbeInstalled: Boolean(panelProbeTimer),
       processing,
@@ -651,6 +825,9 @@ export function installInRenderer(initialEvidence, version) {
       lastSkippedUnverified,
       lastUnidentified,
       lastUnidentifiedLabels,
+      lastMetadataResolvedIds,
+      agentMetadataCount: agentMetadata.size,
+      agentMetadataError,
       continuationPasses,
       lastOpenedIds,
       projectionRuns,
@@ -662,6 +839,8 @@ export function installInRenderer(initialEvidence, version) {
       projectedSummaryCompletedCount,
       lastProjectedSummaryIds,
       lastSummaryProjectionAt,
+      visibleActiveCount: headingInfo(activeHeadingPattern)?.count ?? null,
+      visibleCompletedCount: headingInfo(completedHeadingPattern)?.count ?? null,
       lastRunAt,
       lastReason,
       lastError,
@@ -671,12 +850,15 @@ export function installInRenderer(initialEvidence, version) {
   function disconnect() {
     disabled = true;
     cancelScheduled();
+    if (projectionTimer) clearTimeout(projectionTimer);
+    projectionTimer = null;
     if (panelProbeTimer) clearInterval(panelProbeTimer);
     panelProbeTimer = null;
     abortActive('disconnected');
     restoreProjectedStatuses();
     document.removeEventListener('click', onDocumentClick, true);
     document.removeEventListener('keydown', onDocumentKeydown, true);
+    document.removeEventListener('visibilitychange', onVisibilityChange);
     delete window.__codexSubagentStatusHotpatch;
   }
 
@@ -688,6 +870,8 @@ export function installInRenderer(initialEvidence, version) {
       const nextEvidence = new Set(payload?.ids || []);
       const gainedCompletion = [...nextEvidence].some((id) => !completionEvidence.has(id));
       completionEvidence = nextEvidence;
+      agentMetadata = normalizeAgentMetadata(payload?.agents);
+      agentMetadataError = payload?.agentMetadataError || null;
       evidenceRevision = payload?.revision || 0;
       evidenceUpdatedAt = payload?.updatedAt || Date.now();
       reconcileProjectedStatuses('completion-evidence-updated');
@@ -704,6 +888,7 @@ export function installInRenderer(initialEvidence, version) {
   window.__codexSubagentStatusHotpatch = api;
   document.addEventListener('click', onDocumentClick, true);
   document.addEventListener('keydown', onDocumentKeydown, true);
+  document.addEventListener('visibilitychange', onVisibilityChange);
   panelProbeTimer = setInterval(checkPanelVisibility, 1000);
   reconcileProjectedStatuses('install');
   checkPanelVisibility();
@@ -762,7 +947,11 @@ export async function main(args = process.argv.slice(2)) {
 
   if (mode === '--once') {
     const targets = await getTargets();
-    const evidenceIndex = await createCompletionEvidenceIndex(sessionsRoot);
+    const evidenceIndex = await createCompletionEvidenceIndex(
+      sessionRoots,
+      () => {},
+      completionEvidenceOptions,
+    );
     try {
       process.stdout.write(JSON.stringify({
         patchVersion,
@@ -785,7 +974,7 @@ export async function main(args = process.argv.slice(2)) {
 
     async function ensureEvidenceIndex() {
       if (evidenceIndex) return evidenceIndex;
-      evidenceIndex = await createCompletionEvidenceIndex(sessionsRoot, (snapshot, reason) => {
+      evidenceIndex = await createCompletionEvidenceIndex(sessionRoots, (snapshot, reason) => {
         broadcastQueue = broadcastQueue.then(async () => {
           for (const target of currentTargets) {
             try {
@@ -798,7 +987,7 @@ export async function main(args = process.argv.slice(2)) {
         }).catch((error) => {
           process.stderr.write(`${new Date().toISOString()} evidence broadcast failed: ${error.message}\n`);
         });
-      });
+      }, completionEvidenceOptions);
       return evidenceIndex;
     }
 

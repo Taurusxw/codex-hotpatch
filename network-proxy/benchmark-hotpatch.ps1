@@ -1,9 +1,9 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateRange(1, 10)]
     [int]$Iterations = 3,
 
-    [ValidateSet('ExplicitHttpsAll', 'ExplicitHttpsMinimal', 'NativeHttps', 'NativeHttpsSystemProxy', 'ExplicitWebSocket', 'NativeWebSocket')]
+    [ValidateSet('ExplicitHttpsAll', 'ExplicitHttpsMinimal', 'NativeHttps', 'NativeHttpsSystemProxy')]
     [string[]]$Candidates = @('ExplicitHttpsAll', 'ExplicitHttpsMinimal', 'NativeHttps', 'NativeHttpsSystemProxy'),
 
     [ValidateSet('Minimal', 'Subagent')]
@@ -59,7 +59,7 @@ function Invoke-CandidateRun {
     param(
         [Parameter(Mandatory = $true)][string]$Candidate,
         [Parameter(Mandatory = $true)][int]$Iteration,
-        [Parameter(Mandatory = $true)][string]$OriginalEnvText,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$OriginalEnvText,
         [Parameter(Mandatory = $true)][string]$ProxyValue,
         [Parameter(Mandatory = $true)][string]$Prompt
     )
@@ -105,7 +105,10 @@ function Invoke-CandidateRun {
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     $firstOutputMs = $null
-    $codexCommand = (Get-Command codex -ErrorAction Stop).Source
+    $codexCommand = Get-CodexDesktopOfficialCliPath
+    if ([string]::IsNullOrWhiteSpace($codexCommand)) {
+        throw '未找到当前 Codex Desktop 对应的官方稳定 CLI，无法运行基准。'
+    }
     $argumentArray = [string[]]$arguments.ToArray()
     & $codexCommand @argumentArray 2>&1 | ForEach-Object {
         if ($null -eq $firstOutputMs) { $firstOutputMs = $stopwatch.ElapsedMilliseconds }

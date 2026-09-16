@@ -1,4 +1,4 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Net.Http
 
@@ -113,9 +113,71 @@ function Stop-CodexHotpatchHelpers(
 ) {
     $helpers = Get-CodexHotpatchHelperProcesses -InstalledManager $InstalledManager `
         -InstalledInjector $InstalledInjector
-    foreach ($process in @($helpers.WatcherProcesses) + @($helpers.InjectorProcesses)) {
-        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    $processIds = @(
+        @($helpers.WatcherProcesses) + @($helpers.InjectorProcesses) |
+            Select-Object -ExpandProperty ProcessId -Unique
+    )
+    if ($processIds.Count -eq 0) { return }
+
+    $trackedProcesses = @($processIds | ForEach-Object {
+        Get-Process -Id $_ -ErrorAction SilentlyContinue
+    })
+    foreach ($process in $trackedProcesses) {
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
     }
+
+    # Wait for process teardown so named mutexes are released before a replacement
+    # watcher starts. Without this barrier a rapid reinstall can launch a watcher
+    # that observes the old mutex, exits cleanly, and leaves no supervisor running.
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    $timedOut = @()
+    foreach ($process in $trackedProcesses) {
+        try {
+            $remainingMilliseconds = [int][Math]::Max(
+                0,
+                [Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            )
+            if (-not $process.HasExited -and -not $process.WaitForExit($remainingMilliseconds)) {
+                $timedOut += $process.Id
+            }
+        }
+        catch {
+            # A process that disappeared between discovery and waiting is stopped.
+        }
+        finally {
+            $process.Dispose()
+        }
+    }
+    if ($timedOut.Count -gt 0) {
+        throw "Timed out waiting for old hotpatch helpers to exit: $($timedOut -join ', ')"
+    }
+}
+
+function Wait-CodexHotpatchWatcherReady(
+    [string]$InstalledManager,
+    [string]$InstalledInjector,
+    [int]$TimeoutMilliseconds = 5000,
+    [int]$StabilityMilliseconds = 500
+) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $helpers = Get-CodexHotpatchHelperProcesses -InstalledManager $InstalledManager `
+            -InstalledInjector $InstalledInjector
+        $watcher = @($helpers.WatcherProcesses | Sort-Object CreationDate -Descending | Select-Object -First 1)
+        if ($watcher.Count -gt 0) {
+            $watcherId = [int]$watcher[0].ProcessId
+            Start-Sleep -Milliseconds $StabilityMilliseconds
+            $confirmation = Get-CodexHotpatchHelperProcesses -InstalledManager $InstalledManager `
+                -InstalledInjector $InstalledInjector
+            if (@($confirmation.WatcherProcesses | Where-Object {
+                [int]$_.ProcessId -eq $watcherId
+            }).Count -gt 0) {
+                return
+            }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw 'Hotpatch watcher did not remain running after launch.'
 }
 
 function Start-CodexHotpatchWatcher(
@@ -135,6 +197,8 @@ function Start-CodexHotpatchWatcher(
     Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -WindowStyle Hidden `
         -WorkingDirectory $InstallRoot `
         -RedirectStandardOutput $log -RedirectStandardError $errorLog | Out-Null
+    Wait-CodexHotpatchWatcherReady -InstalledManager $InstalledManager `
+        -InstalledInjector $InstalledInjector
 }
 
 function Stop-CodexInjectorProcess([Diagnostics.Process]$Process) {
@@ -268,4 +332,4 @@ function Start-CodexInjectorSupervisor {
 Export-ModuleMember -Function Get-CodexNodeCommand, Get-CodexDebugPort, `
     Get-CodexHotpatchInjectorVersion, Invoke-CodexHotpatchInjector, `
     Get-CodexHotpatchHelperProcesses, Stop-CodexHotpatchHelpers, `
-    Start-CodexHotpatchWatcher, Start-CodexInjectorSupervisor
+    Wait-CodexHotpatchWatcherReady, Start-CodexHotpatchWatcher, Start-CodexInjectorSupervisor

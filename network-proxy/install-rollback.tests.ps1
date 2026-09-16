@@ -22,11 +22,14 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("codex-hotpatch-install-rollba
 New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
 try {
     $InstallRoot = Join-Path $testRoot 'install'
+    $ExplicitProxyDisabledPath = Join-Path $InstallRoot 'explicit-proxy.disabled'
     $InstalledManager = Join-Path $InstallRoot 'manage-hotpatch.ps1'
     $InstalledNetworkHealthModule = Join-Path $InstallRoot 'network-health.psm1'
     $InstalledNetworkRuntimeObserver = Join-Path $InstallRoot 'network-runtime-observer.psm1'
     $InstalledNetworkWatchdog = Join-Path $InstallRoot 'network-watchdog.ps1'
     $NetworkHealthPath = Join-Path $InstallRoot 'network-health.json'
+    $TransportStatePath = Join-Path $InstallRoot 'transport-state.json'
+    $CoreRouteStatePath = Join-Path $InstallRoot 'network-core-routes.json'
     $CodexConfigPath = Join-Path $testRoot 'config.toml'
     $CodexEnvPath = Join-Path $testRoot '.env'
     $ShortcutPath = Join-Path $testRoot 'optimized.lnk'
@@ -38,6 +41,8 @@ try {
         $CodexConfigPath = 'config-before'
         $CodexEnvPath = ''
         $NetworkHealthPath = 'health-before'
+        $TransportStatePath = 'transport-before'
+        $CoreRouteStatePath = 'routes-before'
         $InstalledManager = 'manager-before'
         $InstalledNetworkHealthModule = 'module-before'
         $InstalledNetworkRuntimeObserver = 'observer-before'

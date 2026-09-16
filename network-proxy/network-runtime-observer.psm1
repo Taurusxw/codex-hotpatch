@@ -18,13 +18,15 @@ namespace CodexHotpatch
         public long Timestamp { get; private set; }
         public string ProcessUuid { get; private set; }
         public string Body { get; private set; }
+        public string Transport { get; private set; }
 
-        public NetworkLogRow(long id, long timestamp, string processUuid, string body)
+        public NetworkLogRow(long id, long timestamp, string processUuid, string body, string transport)
         {
             Id = id;
             Timestamp = timestamp;
             ProcessUuid = processUuid;
             Body = body;
+            Transport = transport;
         }
     }
 
@@ -144,8 +146,17 @@ namespace CodexHotpatch
 
             string sql = String.Format(
                 System.Globalization.CultureInfo.InvariantCulture,
-                "SELECT id, ts, process_uuid, feedback_log_body FROM logs " +
-                "WHERE id > {0} AND id <= {1} AND target = 'codex_core::responses_retry' ORDER BY id",
+                "SELECT retry.id, retry.ts, retry.process_uuid, retry.feedback_log_body, " +
+                "COALESCE((SELECT CASE endpoint.target " +
+                "WHEN 'codex_api::endpoint::responses_websocket' THEN 'WebSocket' " +
+                "WHEN 'codex_http_client::request' THEN 'HttpSse' END " +
+                "FROM logs endpoint WHERE endpoint.process_uuid = retry.process_uuid " +
+                "AND endpoint.id < retry.id AND endpoint.ts >= retry.ts - 300 AND endpoint.ts <= retry.ts " +
+                "AND endpoint.target IN ('codex_api::endpoint::responses_websocket', 'codex_http_client::request') " +
+                "AND instr(endpoint.feedback_log_body, 'turn_id=' || substr(retry.feedback_log_body, instr(retry.feedback_log_body, 'turn_id=') + 8, 36)) > 0 " +
+                "ORDER BY endpoint.id DESC LIMIT 1), 'Unknown') " +
+                "FROM logs retry WHERE retry.id > {0} AND retry.id <= {1} " +
+                "AND retry.target = 'codex_core::responses_retry' ORDER BY retry.id",
                 lowerExclusive,
                 upperInclusive);
             IntPtr database = IntPtr.Zero;
@@ -165,11 +176,13 @@ namespace CodexHotpatch
                     }
                     string processUuid = ReadUtf8(sqlite3_column_text(statement, 2), sqlite3_column_bytes(statement, 2));
                     string body = ReadUtf8(sqlite3_column_text(statement, 3), sqlite3_column_bytes(statement, 3));
+                    string transport = ReadUtf8(sqlite3_column_text(statement, 4), sqlite3_column_bytes(statement, 4));
                     rows.Add(new NetworkLogRow(
                         sqlite3_column_int64(statement, 0),
                         sqlite3_column_int64(statement, 1),
                         processUuid,
-                        body));
+                        body,
+                        transport));
                 }
                 return rows.ToArray();
             }
@@ -272,7 +285,8 @@ function ConvertTo-CodexRuntimeNetworkEvent {
     param(
         [Parameter(Mandatory = $true)]$Row,
         [Parameter(Mandatory = $true)][Collections.Generic.HashSet[int]]$ActiveProcessIds,
-        [Parameter(Mandatory = $true)][int]$ExpectedMaxRetries
+        [int[]]$ExpectedMaxRetries = @(),
+        [switch]$IncludeWebSocket
     )
 
     if ([string]$Row.ProcessUuid -notmatch '^pid:(?<pid>\d+):') { return $null }
@@ -280,8 +294,25 @@ function ConvertTo-CodexRuntimeNetworkEvent {
     if (-not $ActiveProcessIds.Contains($processId)) { return $null }
 
     $body = [string]$Row.Body
-    if ($body -notmatch ("\bmax_retries=$ExpectedMaxRetries(?:\s|$)")) { return $null }
-    if ($body -match '(?i)websocket|connection closed normally') { return $null }
+    $maxRetriesMatch = [regex]::Match($body, '\bmax_retries=(?<value>\d+)')
+    if (-not $maxRetriesMatch.Success) { return $null }
+    $maxRetries = [int]$maxRetriesMatch.Groups['value'].Value
+    if ($maxRetries -lt 1 -or $maxRetries -gt 50) { return $null }
+    if (@($ExpectedMaxRetries).Count -gt 0 -and $maxRetries -notin @($ExpectedMaxRetries)) { return $null }
+
+    $transport = if ([string]$Row.Transport -in @('WebSocket', 'HttpSse')) {
+        [string]$Row.Transport
+    }
+    elseif ($body -match '(?i)transport="responses_websocket"|stream_responses_websocket|websocket') {
+        'WebSocket'
+    }
+    elseif ($body -match '(?i)transport="responses_http"|stream_responses_api|https?://|error decoding response body') {
+        'HttpSse'
+    }
+    else {
+        'Unknown'
+    }
+    if ($transport -eq 'WebSocket' -and -not $IncludeWebSocket) { return $null }
 
     $eventClass = $null
     if ($body -match '(?i)error decoding response body') {
@@ -304,6 +335,7 @@ function ConvertTo-CodexRuntimeNetworkEvent {
     $errorText = if ($body.Contains('sampling_error=')) { $body.Split(@('sampling_error='), 2, [StringSplitOptions]::None)[1] } else { $body }
     if ($errorText.Length -gt 500) { $errorText = $errorText.Substring(0, 500) }
     $retryMatch = [regex]::Match($body, '\bretries=(?<value>\d+)')
+    $retry = if ($retryMatch.Success) { [int]$retryMatch.Groups['value'].Value } else { $null }
     $turnMatch = [regex]::Match($body, '\bturn_id=(?<value>[0-9a-f-]+)')
     return [pscustomobject]@{
         LogId = [long]$Row.Id
@@ -311,7 +343,10 @@ function ConvertTo-CodexRuntimeNetworkEvent {
         ProcessId = $processId
         ProcessUuid = [string]$Row.ProcessUuid
         TurnId = if ($turnMatch.Success) { $turnMatch.Groups['value'].Value } else { $null }
-        Retry = if ($retryMatch.Success) { [int]$retryMatch.Groups['value'].Value } else { $null }
+        Retry = $retry
+        MaxRetries = $maxRetries
+        RetriesExhausted = $null -ne $retry -and $retry -ge $maxRetries
+        Transport = $transport
         Class = $eventClass
         Error = $errorText
     }
@@ -323,7 +358,8 @@ function Get-CodexRuntimeNetworkEvents {
         [Parameter(Mandatory = $true)][string]$DatabasePath,
         [Parameter(Mandatory = $true)][string]$CursorPath,
         [int[]]$ActiveProcessIds = @(),
-        [ValidateRange(1, 50)][int]$ExpectedMaxRetries = 8,
+        [int[]]$ExpectedMaxRetries = @(),
+        [switch]$IncludeWebSocket,
         [ValidateRange(0, 1000000)][int]$BootstrapRows = 250000,
         [ValidateRange(1000, 2000000)][int]$MaxScanRows = 500000
     )
@@ -389,7 +425,8 @@ function Get-CodexRuntimeNetworkEvents {
             }
             $events = New-Object 'System.Collections.Generic.List[object]'
             foreach ($row in $rows) {
-                $event = ConvertTo-CodexRuntimeNetworkEvent -Row $row -ActiveProcessIds $activeSet -ExpectedMaxRetries $ExpectedMaxRetries
+                $event = ConvertTo-CodexRuntimeNetworkEvent -Row $row -ActiveProcessIds $activeSet `
+                    -ExpectedMaxRetries $ExpectedMaxRetries -IncludeWebSocket:$IncludeWebSocket
                 if ($null -ne $event) { $events.Add($event) }
             }
 
@@ -427,7 +464,8 @@ function Get-CodexRecentRuntimeNetworkEvents {
     param(
         [Parameter(Mandatory = $true)][string]$DatabasePath,
         [int[]]$ActiveProcessIds = @(),
-        [ValidateRange(1, 50)][int]$ExpectedMaxRetries = 8,
+        [int[]]$ExpectedMaxRetries = @(),
+        [switch]$IncludeWebSocket,
         [TimeSpan]$FailureWindow = ([TimeSpan]::FromMinutes(10)),
         [DateTime]$NowUtc = [DateTime]::UtcNow,
         [ValidateRange(1000, 2000000)][int]$MaxScanRows = 500000
@@ -459,7 +497,8 @@ function Get-CodexRecentRuntimeNetworkEvents {
         $windowStart = $now.Subtract($FailureWindow)
         $events = New-Object 'System.Collections.Generic.List[object]'
         foreach ($row in $rows) {
-            $event = ConvertTo-CodexRuntimeNetworkEvent -Row $row -ActiveProcessIds $activeSet -ExpectedMaxRetries $ExpectedMaxRetries
+            $event = ConvertTo-CodexRuntimeNetworkEvent -Row $row -ActiveProcessIds $activeSet `
+                -ExpectedMaxRetries $ExpectedMaxRetries -IncludeWebSocket:$IncludeWebSocket
             if ($null -ne $event -and $event.TimestampUtc -ge $windowStart -and $event.TimestampUtc -le $now) {
                 $events.Add($event)
             }
@@ -499,6 +538,7 @@ function Get-CodexRuntimeNetworkDegradation {
     $now = $NowUtc.ToUniversalTime()
     $windowStart = $now.Subtract($FailureWindow)
     $turnIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $exhaustedTurnIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $recent = New-Object 'System.Collections.Generic.List[object]'
     foreach ($event in @($Events)) {
         if ($null -eq $event -or $null -eq $event.TimestampUtc) { continue }
@@ -512,12 +552,37 @@ function Get-CodexRuntimeNetworkDegradation {
             "log:$($event.LogId)"
         }
         [void]$turnIds.Add($key)
+        $retriesExhaustedProperty = $event.PSObject.Properties['RetriesExhausted']
+        if ($null -ne $retriesExhaustedProperty -and $retriesExhaustedProperty.Value -eq $true) {
+            [void]$exhaustedTurnIds.Add($key)
+        }
     }
 
+    # A single long-running HTTP turn can repeatedly fail without reaching the
+    # cross-turn threshold. Require separate retries spanning five minutes;
+    # duplicate log rows and short retry bursts must not trigger this path.
+    $persistentTurnCount = 0
+    $httpEvents = @($recent | Where-Object {
+        $_.PSObject.Properties['Transport'] -and $_.Transport -eq 'HttpSse' -and
+        $_.PSObject.Properties['ProcessUuid'] -and $_.PSObject.Properties['Retry'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$_.TurnId)
+    })
+    foreach ($group in @($httpEvents | Group-Object ProcessUuid, TurnId)) {
+        $ordered = @($group.Group | Sort-Object TimestampUtc, LogId)
+        $retryValues = @($ordered | Where-Object { $null -ne $_.Retry } | Select-Object -ExpandProperty Retry -Unique)
+        if ($retryValues.Count -ge 2 -and
+            (([DateTime]$ordered[-1].TimestampUtc) - ([DateTime]$ordered[0].TimestampUtc)).TotalSeconds -ge 300) {
+            $persistentTurnCount++
+        }
+    }
     $latest = @($recent | Sort-Object TimestampUtc, LogId | Select-Object -Last 1)
+    $degraded = $turnIds.Count -ge $FailureThreshold
     return [pscustomobject]@{
-        Degraded = $turnIds.Count -ge $FailureThreshold
+        Degraded = $degraded
+        FailoverRequired = $degraded -or $exhaustedTurnIds.Count -gt 0 -or $persistentTurnCount -gt 0
+        PersistentTurnCount = $persistentTurnCount
         DistinctTurnCount = $turnIds.Count
+        ExhaustedTurnCount = $exhaustedTurnIds.Count
         EventCount = $recent.Count
         FailureThreshold = $FailureThreshold
         WindowStartUtc = $windowStart

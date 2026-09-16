@@ -15,6 +15,11 @@ function Assert-Equal {
 $statePath = Join-Path ([IO.Path]::GetTempPath()) ("codex-network-circuit-test-$PID.json")
 $start = [DateTimeOffset]::Parse('2026-08-16T10:00:00Z').UtcDateTime
 try {
+    $preciseTime = [DateTimeOffset]::Parse('2026-09-04T08:09:54.6731003Z').UtcDateTime
+    Update-CodexNetworkCircuitState -Path $statePath -Outcome Success -NowUtc $preciseTime | Out-Null
+    $preciseState = Get-CodexNetworkCircuitState -Path $statePath -NowUtc $preciseTime
+    Assert-Equal $preciseState.LastSuccessUtc.Ticks $preciseTime.Ticks 'JSON 读取不得丢失用于核心归属判断的亚秒时间。'
+    [IO.File]::Delete($statePath)
     $initial = Get-CodexNetworkCircuitState -Path $statePath -NowUtc $start
     Assert-Equal $initial.CircuitState 'Closed' '缺省状态必须关闭熔断器。'
     Assert-Equal $initial.ConsecutiveFailures 0 '缺省状态不得包含失败次数。'

@@ -4,6 +4,9 @@ $ErrorActionPreference = 'Stop'
 function ConvertTo-CodexUtcDate {
     param([AllowNull()]$Value)
 
+    # PowerShell 7 converts JSON timestamps to DateTime; string casting discards fractions/kind.
+    if ($Value -is [DateTime]) { return $Value.ToUniversalTime() }
+    if ($Value -is [DateTimeOffset]) { return $Value.UtcDateTime }
     if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
     return [DateTime]::Parse(
         [string]$Value,
@@ -224,6 +227,7 @@ function Update-CodexNetworkCircuitState {
         [TimeSpan]$OpenCooldown = ([TimeSpan]::FromMinutes(30)),
         [TimeSpan]$RuntimeFailureDecay = ([TimeSpan]::FromDays(7)),
         [TimeSpan]$RuntimeFailureMaxCooldown = ([TimeSpan]::FromDays(7)),
+        [switch]$PreserveStableSuccessBoundary,
         [DateTime]$NowUtc = [DateTime]::UtcNow
     )
 
@@ -237,6 +241,11 @@ function Update-CodexNetworkCircuitState {
     return Invoke-WithCodexNetworkMutex -Path $Path -Action {
         $current = Get-CodexNetworkCircuitStateCore -Path $Path -NowUtc $now
         if ($Outcome -eq 'Success') {
+            if ($PreserveStableSuccessBoundary -and -not $current.IsCorrupt -and
+                $current.CircuitState -eq 'Closed' -and $current.ConsecutiveFailures -eq 0 -and
+                $null -ne $current.LastSuccessUtc) {
+                return $current
+            }
             $next = New-CodexNetworkCircuitState `
                 -CircuitState Closed `
                 -ConsecutiveFailures 0 `
