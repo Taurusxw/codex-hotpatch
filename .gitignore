@@ -9,8 +9,8 @@ HANDOFF.md
 *.sqlite-*
 *.db
 *.db-*
-network-health.json
-network-runtime-cursor.json
+runtime-status.json
+runtime-status.json.tmp
 *.lnk
 
 # Tooling and editor output

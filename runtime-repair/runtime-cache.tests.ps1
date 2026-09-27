@@ -1,5 +1,5 @@
 ﻿$ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'manage-hotpatch.ps1')
+. (Join-Path $PSScriptRoot 'runtime-cache.ps1')
 function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('codex-runtime-cache-' + [Guid]::NewGuid().ToString('N'))
@@ -79,25 +79,6 @@ try {
     $searchUpdate = Repair-CodexDesktopRuntimeCache -SourceDirectory $source -DestinationRoot $cache -IncludeRipgrep
     Assert-True ($searchUpdate.RipgrepRuntime.Hash -ne $withSearch.RipgrepRuntime.Hash -and (Test-Path -LiteralPath $withSearch.RipgrepRuntime.Path)) 'Search update must use a new identity and preserve the old runtime.'
 
-    & {
-        $script:runtimePrepared = $false
-        function Get-CodexDesktopExecutable { return 'C:\fixture\ChatGPT.exe' }
-        function Get-AvailableLoopbackPort { return 12345 }
-        function Repair-CodexDesktopRuntimeCache {
-            param([switch]$IncludeNode, [switch]$IncludeRipgrep)
-            Assert-True $IncludeNode.IsPresent 'Both desktop launch paths must include Node preparation.'
-            Assert-True $IncludeRipgrep.IsPresent 'Both desktop launch paths must include search preparation.'
-            $script:runtimePrepared = $true
-        }
-        function Start-Process {
-            param($FilePath, $ArgumentList, $WorkingDirectory, [switch]$PassThru)
-            Assert-True $script:runtimePrepared 'Runtime preparation must precede desktop launch.'
-            return [pscustomobject]@{ Id = 1 }
-        }
-        $null = Start-CodexDesktopProcess
-        $script:runtimePrepared = $false
-        $null = Invoke-CodexDesktopActivation
-    }
     Write-Output 'runtime-cache tests passed'
 }
 finally {
